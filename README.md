@@ -12,11 +12,21 @@ Based on [drunkdream/weread-exporter](https://github.com/drunkdream/weread-expor
 
 ### 实现原理
 
-微信读书网页版的正文不是 DOM 文本，而是绘制在 Canvas 上的。本工具用 Playwright 驱动本机 Chrome 打开阅读页，向页面注入一段脚本劫持 Canvas 2D 上下文，把每一次 `fillText` 调用（连同字号、颜色、坐标）还原成 Markdown，再转换成 epub / pdf / txt 格式；mobi 格式由 kindlegen 从 epub 转换而来。
+微信读书网页版的正文不是普通 DOM 文本，而且同一章里有两种渲染方式：
+
+- 章节开头若干屏画在 Canvas 上，逐字调用 `fillText`；
+- 其余正文是逐字绝对定位的 `<span>`，DOM 顺序被打乱，只有 CSS `transform` 上的坐标可用，并且随视口虚拟化，滚出视野就会被移除。
+
+本工具用 Playwright 驱动本机 Chrome 打开阅读页，注入脚本同时采集这两类内容：接管 `fillText` 记录画布文字，一边逐屏滚动一边采集页面上的定位 `span`。两者的坐标都归一到同一个内容容器坐标系，再按 (y, x) 排序还原阅读顺序，图片、代码块、分隔线按同一套坐标插回正文之间，最后生成 Markdown 并转换成 epub / pdf / txt；mobi 格式由 kindlegen 从 epub 转换而来。
+
+采完一章后还会校验正文的纵向覆盖：如果某段区间既没有文字也没有图片可以解释这片空白，就说明有内容没采到，工具会回滚到那个位置补采，必要时重新加载整章重采。
 
 ### 与原项目的差异
 
 - 浏览器驱动从 pyppeteer 换成 Playwright，优先使用本机已安装的 Google Chrome。
+- 长章节不再缺内容：原项目只采集 Canvas 上的文字，而微信读书现在把长章节的大部分正文改成了定位 `span`，导致长章节只能导出开头。实测一章 9832 字的内容，原方案只拿到约 2400 字。
+- 图片不再重复：原项目会把同一张图既按位置插入又在章末追加一遍。
+- 每章导出后按坐标覆盖校验完整性，发现空洞会自动补采并在日志里给出结论，导出结束时汇总仍不完整的章节。
 - 登录态保存在独立的浏览器 profile 目录（默认 `cache/chrome-profile`），多次运行之间不会丢失，不再需要手工维护 cookie。
 - 首次运行自动弹出二维码，扫码后自动继续；导出中途遇到需要登录的章节同样会自动弹出二维码。
 - 自动识别并切换阅读模式：登录用户的阅读页可能处于"横向翻页"模式，该模式下无法按章导出，工具会自动切回竖向滚动模式。
@@ -75,7 +85,24 @@ python -m weread_exporter -b <book_id> -o epub -o pdf
 | `--css-file` | 覆盖默认样式 | 无 |
 | `--debug` | 把浏览器 console 输出保存到 `cache/<book_id>/console.log` | 关 |
 
-默认节奏下每章约等待 30 秒，一本 60 章的书大约需要 40 分钟。缩短 `--load-interval` 可以加快速度，但请求过于频繁可能触发风控，请自行权衡。
+默认节奏下每章约等待 30 秒，一本 60 章的书大约需要 40 到 50 分钟。缩短 `--load-interval` 可以加快速度，但请求过于频繁可能触发风控，请自行权衡。等待之外，每章还要逐屏滚完才能采全正文，短章节 1 到 2 秒，最长的万字章节约 12 秒，日志里会打印实际耗时。
+
+已导出的章节缓存在 `cache/<book_id>/chapters/`，重新运行时会跳过。想整本重新导出，需要先清空这个目录，并把 `output/` 下同名的 epub / pdf 移走，否则会被当成已完成而跳过。`cache/<book_id>/images/` 可以保留，图片按 URL 哈希命名，能直接复用。
+
+### 测试
+
+两个脚本需要先完成一次扫码登录，并且缓存里已有对应书的 `meta.json`：
+
+```bash
+# 正文提取：覆盖空洞、字数比值、图片去重、重复采集一致性，
+# 并用横向双栏模式的绘制顺序作独立参照双向比对阅读顺序与完整性
+python tests/check_extract.py [book_id]
+
+# 兼容性：账号处于横向双栏模式时的入口、游客无头模式、页面无 JS 异常
+python tests/check_compat.py [book_id]
+```
+
+两个脚本都会打印逐项 PASS / FAIL 与汇总，进程退出码非零表示有失败项。
 
 ### 隐私与缓存
 
@@ -95,11 +122,21 @@ python -m weread_exporter -b <book_id> -o epub -o pdf
 
 ### How it works
 
-WeRead's web reader does not render book text as DOM nodes; it draws the text onto a Canvas. This tool drives your local Chrome with Playwright, injects a script that proxies the Canvas 2D context, reconstructs Markdown from every `fillText` call (together with font size, color and position), and then converts the Markdown to epub / pdf / txt. The mobi format is produced from epub with kindlegen.
+WeRead's web reader does not render book text as ordinary DOM text, and a single chapter uses two different rendering paths:
+
+- the first few screens are painted onto a Canvas, one `fillText` call per character;
+- the rest of the text consists of absolutely positioned per-character `<span>` elements whose DOM order is shuffled, whose only usable coordinates live in the CSS `transform`, and which are virtualized away once they scroll out of view.
+
+This tool drives your local Chrome with Playwright and captures both: it wraps `fillText` to record canvas text, and sweeps the chapter screen by screen to harvest the positioned spans. Both sources are normalized into the same content-container coordinate space, sorted by (y, x) to recover the reading order, with images, code blocks and rules re-inserted by the same coordinates. The result is Markdown, converted to epub / pdf / txt; mobi is produced from epub with kindlegen.
+
+After each chapter the vertical coverage is verified: any stretch explained by neither text nor an image means content was missed, so the tool scrolls back to repair it and, if needed, reloads the whole chapter.
 
 ### What's different from upstream
 
 - Browser automation moved from pyppeteer to Playwright, using the locally installed Google Chrome by default.
+- Long chapters are no longer truncated. Upstream only captures canvas text, but WeRead now renders most of a long chapter as positioned spans, so only the beginning was exported. On a 9832-word chapter the old approach captured about 2400 characters.
+- Images are no longer duplicated. Upstream inserted each image by position and appended it again at the end of the chapter.
+- Every chapter is checked for coverage gaps, repaired automatically, and any chapter that still looks incomplete is listed when the export finishes.
 - Login state lives in a dedicated browser profile (`cache/chrome-profile` by default) and survives across runs; no manual cookie handling.
 - The first run opens a WeChat QR code automatically and continues once you have scanned it. Chapters that require login mid-export trigger the QR code as well.
 - Reader mode is detected and fixed automatically: logged-in accounts may open the reader in "horizontal paging" mode, which cannot be exported chapter by chapter, so the tool switches it back to vertical scrolling.
@@ -158,7 +195,26 @@ The first run shows a WeChat login QR code; scan it and the export starts automa
 | `--css-file` | Override the default stylesheet | none |
 | `--debug` | Save browser console output to `cache/<book_id>/console.log` | off |
 
-With the default pace each chapter waits about 30 seconds, so a 60-chapter book takes roughly 40 minutes. Lowering `--load-interval` speeds things up, but very frequent requests may trigger WeRead's rate limiting; choose your own trade-off.
+With the default pace each chapter waits about 30 seconds, so a 60-chapter book takes roughly 40 to 50 minutes. Lowering `--load-interval` speeds things up, but very frequent requests may trigger WeRead's rate limiting; choose your own trade-off. On top of the waiting, each chapter is swept screen by screen to capture all of its text: 1 to 2 seconds for short chapters and about 12 seconds for the longest ten-thousand-character one. The log prints the actual time.
+
+Exported chapters are cached under `cache/<book_id>/chapters/` and skipped on later runs. To re-export a whole book, empty that directory and move the matching epub / pdf out of `output/`, otherwise both are treated as already done. `cache/<book_id>/images/` can stay, since images are named by URL hash and reused.
+
+### Tests
+
+Both scripts need a completed QR login and an existing `meta.json` for the book in the cache:
+
+```bash
+# Content extraction: coverage gaps, character-count ratio, image de-duplication,
+# repeated-run consistency, plus a two-way comparison against the reading order
+# drawn by the horizontal two-column mode as an independent reference
+python tests/check_extract.py [book_id]
+
+# Compatibility: entering with the account in horizontal mode, guest headless mode,
+# and no page-side JS errors
+python tests/check_compat.py [book_id]
+```
+
+Each script prints per-item PASS / FAIL plus a summary and exits non-zero on failure.
 
 ### Privacy and cache
 

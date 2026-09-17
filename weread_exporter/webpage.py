@@ -30,6 +30,26 @@ HOOK_SCRIPT_PATH: str = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "hook.js"
 )
 
+# 阅读页整页滚动，正文元素随视口虚拟化，靠这几段脚本驱动逐屏采集
+SCROLL_STATE_SCRIPT = """() => {
+  const se = document.scrollingElement || document.documentElement;
+  const top = Math.round(se.scrollTop);
+  const height = se.scrollHeight;
+  const view = window.innerHeight;
+  return { top: top, height: height, view: view, bottom: top + view >= height - 4 };
+}"""
+
+SCROLL_STEP_SCRIPT = """(ratio) => {
+  const se = document.scrollingElement || document.documentElement;
+  se.scrollTop = se.scrollTop + window.innerHeight * ratio;
+}"""
+
+SCROLL_TO_SCRIPT = """(top) => {
+  const se = document.scrollingElement || document.documentElement;
+  se.scrollTop = Math.max(0, top);
+}"""
+
+
 DETECT_HEADLESS_SCRIPT = """
 const webdriver = navigator.webdriver === true;
 const chromeObj = typeof window.chrome !== "undefined";
@@ -50,6 +70,14 @@ class WeReadWebPage(object):
 
     root_url: str = "https://weread.qq.com"
     window_size: Tuple[int, int] = (1920, 1080)
+    # 逐屏采集的步长（相对视口高度）、每步等待与步数上限；
+    # 步子太大或太快会漏掉虚拟化的正文，太小则整章耗时明显变长
+    sweep_step_ratio: float = 0.55
+    sweep_interval: float = 0.25
+    sweep_max_steps: int = 400
+    # 正文空洞的回滚补采轮次与每轮处理的空洞数上限
+    gap_repair_rounds: int = 3
+    gap_repair_limit: int = 20
     # 埋点/日志上报接口：直接返回成功，避免真实上报，也减少无关请求
     telemetry_url_patterns: Tuple[str, ...] = (
         "**/hera/**",
@@ -99,6 +127,8 @@ class WeReadWebPage(object):
         self._console_log: Optional[Any] = None
         self._headless: bool = False
         self._user_name: str = ""
+        # 最近一次取文后仍未补上的正文空洞，调用方据此判断是否需要重采
+        self._last_content_gaps: List[List[int]] = []
         self._url: str = ""
 
     @property
@@ -204,7 +234,7 @@ class WeReadWebPage(object):
         await self._add_reader_mode_cookie()
 
         if self._debug:
-            # hook.js 每章会产生上万条 console 输出，只在调试时才收集
+            # 只在调试时收集页面 console 输出
             log_dir = os.path.dirname(self._console_log_path)
             if not os.path.isdir(log_dir):
                 os.makedirs(log_dir)
@@ -430,7 +460,7 @@ class WeReadWebPage(object):
         with open(HOOK_SCRIPT_PATH, encoding="utf-8") as fp:
             hook_script = fp.read()
         # 只在阅读页启用 canvas 钩子，详情页和登录二维码 iframe 不受影响；
-        # __wereadDebug 控制 hook.js 是否输出逐次 canvas 调用的调试日志
+        # __wereadDebug 控制 hook.js 是否输出调试日志
         return (
             "window.__wereadDebug = %s;\n"
             "if (location.pathname.startsWith('/web/reader/')) {\n%s\n}\n"
@@ -490,55 +520,176 @@ class WeReadWebPage(object):
         )
 
     async def get_markdown(self) -> str:
-        # 由浏览器侧判断渲染完成，条件满足时立即返回；超时则按现有内容继续
+        """采集并还原当前章节的 markdown
+
+        阅读页的正文分两种渲染方式：开头若干屏画在 canvas 上，其余是随视口
+        虚拟化的绝对定位 span，滚出视野就会被移除。因此必须滚完整章边滚边采，
+        最后再校验一遍正文的纵向覆盖，有空洞就回滚补采。
+        """
+        if not await self._page.evaluate("() => !!window.wrExtractor"):
+            raise RuntimeError(
+                "Content extractor is not installed on %s" % self._page.url
+            )
+        started = time.time()
+        await self._page.evaluate("wrExtractor.harvest()")
+        await self._wait_render_settled()
+        steps = await self._sweep_chapter()
+        gaps = await self._repair_gaps()
+        self._last_content_gaps = gaps
+        stats: Dict[str, Any] = await self._page.evaluate("wrExtractor.stats()")
+        markdown: str = await self._page.evaluate("wrExtractor.build()")
+        logging.info(
+            "[%s] Extracted %d chars (canvas %d + span %d), %d lines, %d elements, "
+            "%d sweep steps in %.1fs"
+            % (
+                self.__class__.__name__,
+                stats.get("canvasChars", 0) + stats.get("spanChars", 0),
+                stats.get("canvasChars", 0),
+                stats.get("spanChars", 0),
+                stats.get("lines", 0),
+                stats.get("elemItems", 0),
+                steps,
+                time.time() - started,
+            )
+        )
+        if gaps:
+            logging.warning(
+                "[%s] %d content gap(s) remain after repair: %s"
+                % (self.__class__.__name__, len(gaps), gaps[:5])
+            )
+        if not markdown:
+            raise RuntimeError("Extract chapter content failed, nothing captured")
+        return markdown
+
+    @property
+    def last_content_gaps(self) -> List[List[int]]:
+        """最近一次取文后仍未补上的正文空洞（内容容器坐标）"""
+        return self._last_content_gaps
+
+    async def _wait_render_settled(self, quiet: int = 500, timeout: int = 20) -> None:
+        """等待 canvas 绘制安静下来；超时则按已采到的内容继续"""
         try:
             await self._page.wait_for_function(
-                "() => window.canvasContextHandler && canvasContextHandler.data.complete",
-                timeout=10 * 1000,
+                "(quiet) => { const s = window.wrExtractor && wrExtractor.pulse();"
+                " return !!s && (s.textItems > 0 || s.elemItems > 0) && s.lastDrawAgo >= quiet; }",
+                arg=quiet,
+                timeout=timeout * 1000,
                 polling=100,
             )
         except PlaywrightTimeoutError:
             logging.info(
-                "[%s] Wait for canvas complete timeout" % self.__class__.__name__
+                "[%s] Wait for canvas render settled timeout" % self.__class__.__name__
             )
-        script = "canvasContextHandler.data.markdown;"
-        result = await self._page.evaluate(script)
-        if not result:
-            await self._page.evaluate("canvasContextHandler.updateMarkdown();")
-            result = await self._page.evaluate(script)
-            if not result:
-                raise RuntimeError("Wait for creating markdown timeout")
-        return result
 
-    async def _check_next_page(self) -> None:
-        while True:
-            try:
-                # 竖向滚动模式渲染完成后出现「下一章」按钮；横向翻页模式则是「上一页/下一页」
-                await self._page.wait_for_selector(
-                    "button.readerFooter_button, button.renderTarget_pager_button",
-                    timeout=60 * 1000,
-                )
-            except PlaywrightTimeoutError:
-                logging.info("[%s] load selector timeout " % self.__class__.__name__)
-                await self._dump_page_state()
+    async def _scroll_state(self) -> Dict[str, Any]:
+        return await self._page.evaluate(SCROLL_STATE_SCRIPT)
+
+    async def _scroll_to(self, top: int) -> None:
+        await self._page.evaluate(SCROLL_TO_SCRIPT, top)
+
+    async def _footer_text(self) -> str:
+        """页脚按钮的文字：竖向模式下为「下一页」「下一章」，未登录时为「登录…」"""
+        button = self._page.locator("button.readerFooter_button")
+        try:
+            if not await button.count():
+                return ""
+            return (await button.first.inner_text()).strip()
+        except PlaywrightError:
+            return ""
+
+    async def _click_next_page(self) -> bool:
+        """页面已到底但仍有「下一页」时继续翻页，兼容不靠滚动推进的版面"""
+        if await self._footer_text() != "下一页":
+            return False
+        logging.debug("[%s] Click next page" % self.__class__.__name__)
+        try:
+            await self._page.locator("button.readerFooter_button").first.click(
+                timeout=5000
+            )
+        except PlaywrightError:
+            return False
+        return True
+
+    async def _sweep_chapter(self) -> int:
+        """逐屏滚完整章，边滚边采集虚拟化的正文元素"""
+        steps = 0
+        stalled = 0
+        await self._page.evaluate("wrExtractor.harvest()")
+        while steps < self.sweep_max_steps:
+            state = await self._scroll_state()
+            if state["bottom"]:
+                if await self._click_next_page():
+                    steps += 1
+                    await asyncio.sleep(self.sweep_interval * 2)
+                    await self._page.evaluate("wrExtractor.harvest()")
+                    continue
                 break
-            if await self._page.locator("button.renderTarget_pager_button").count():
-                raise HorizontalReaderError()
-            button = self._page.locator("button.readerFooter_button").first
-            result = (await button.inner_text()).strip()
-            if result == "下一页":
-                logging.info("[%s] Go to next page" % self.__class__.__name__)
-                await self._page.evaluate(
-                    r"canvasContextHandler.data.markdown += '\n\n';"
-                )
-                await button.click()
-                await asyncio.sleep(1)
-            elif result == "下一章":
-                break
-            elif result.startswith("登录"):
-                raise utils.LoginRequiredError("Login required to read this chapter")
+            await self._page.evaluate(SCROLL_STEP_SCRIPT, self.sweep_step_ratio)
+            await asyncio.sleep(self.sweep_interval)
+            await self._page.evaluate("wrExtractor.harvest()")
+            after = await self._scroll_state()
+            if after["top"] <= state["top"] + 1:
+                stalled += 1
+                if stalled >= 3:
+                    break
             else:
-                raise NotImplementedError(result)
+                stalled = 0
+            steps += 1
+        await self._wait_render_settled(quiet=400, timeout=8)
+        await self._page.evaluate("wrExtractor.harvest()")
+        return steps
+
+    async def _repair_gaps(self) -> List[List[int]]:
+        """回滚补采正文里的空洞，返回仍未补上的空洞区间"""
+        gaps: List[List[int]] = await self._page.evaluate("wrExtractor.findGaps()")
+        if not gaps:
+            return []
+        view: int = await self._page.evaluate("() => window.innerHeight")
+        origin: Dict[str, Any] = await self._page.evaluate("wrExtractor.origin()")
+        origin_top = int(origin.get("top", 0))
+        step = max(120, int(view * self.sweep_step_ratio))
+        for index in range(self.gap_repair_rounds):
+            logging.info(
+                "[%s] Repair %d content gap(s), round %d"
+                % (self.__class__.__name__, len(gaps), index + 1)
+            )
+            for gap in gaps[: self.gap_repair_limit]:
+                top = max(0, origin_top + gap[0] - 200)
+                end = origin_top + gap[1]
+                for _ in range(8):
+                    await self._scroll_to(top)
+                    await asyncio.sleep(self.sweep_interval + 0.1)
+                    await self._page.evaluate("wrExtractor.harvest()")
+                    top += step
+                    if top >= end:
+                        break
+            remain: List[List[int]] = await self._page.evaluate("wrExtractor.findGaps()")
+            if not remain:
+                return []
+            if len(remain) >= len(gaps):
+                # 补采没有任何进展，再滚也是白滚
+                return remain
+            gaps = remain
+        return gaps
+
+    async def _wait_reader_ready(self, timeout: int = 60) -> None:
+        """等待阅读页就绪，同时识别横向翻页模式与需要登录的情况"""
+        try:
+            await self._page.wait_for_selector(
+                "button.readerFooter_button, button.renderTarget_pager_button",
+                timeout=timeout * 1000,
+            )
+        except PlaywrightTimeoutError:
+            logging.info(
+                "[%s] Wait for reader footer timeout" % self.__class__.__name__
+            )
+            await self._dump_page_state()
+            return
+        if await self._page.locator("button.renderTarget_pager_button").count():
+            raise HorizontalReaderError()
+        text = await self._footer_text()
+        if text.startswith("登录"):
+            raise utils.LoginRequiredError("Login required to read this chapter")
 
     def _get_chapter_url(self, chapter_id: str) -> str:
         return "%s%sk%s" % (
@@ -563,7 +714,9 @@ class WeReadWebPage(object):
                 "Horizontal reader detected, but the mode toggle button is missing"
             )
         await toggle.first.click(timeout=5000)
-        await self._page.wait_for_selector("button.readerFooter_button", timeout=30 * 1000)
+        await self._page.wait_for_selector(
+            "button.readerFooter_button", timeout=30 * 1000
+        )
 
     async def goto_chapter(self, chapter_id: str, timeout: int = 120) -> None:
         logging.info("[%s] Go to chapter %s" % (self.__class__.__name__, chapter_id))
@@ -573,7 +726,7 @@ class WeReadWebPage(object):
         )
         # 需要登录时抛出 LoginRequiredError，由调用方在超时保护之外处理扫码登录
         try:
-            await self._check_next_page()
+            await self._wait_reader_ready()
         except HorizontalReaderError:
             await self._switch_to_vertical_reader()
             # 切换前画布上已经画过横向模式的内容，重新加载让钩子从头记录本章
@@ -581,7 +734,7 @@ class WeReadWebPage(object):
                 self._url, timeout=1000 * timeout, wait_until="domcontentloaded"
             )
             try:
-                await self._check_next_page()
+                await self._wait_reader_ready()
             except HorizontalReaderError:
                 raise RuntimeError(
                     "Reader is still in horizontal mode after switching, "
@@ -589,4 +742,4 @@ class WeReadWebPage(object):
                 )
 
     async def clear_cache(self) -> None:
-        await self._page.evaluate("canvasContextHandler.clearCanvasCache();")
+        await self._page.evaluate("wrExtractor.reset()")

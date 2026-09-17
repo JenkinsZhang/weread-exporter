@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 import time
 from typing import Dict, List, Optional, Any, Tuple
@@ -29,6 +30,15 @@ current_path = os.path.dirname(os.path.abspath(__file__))
 
 
 class WeReadExporter(object):
+    # 完整性校验以正文的纵向覆盖为准（见 hook.js 的 findGaps）。官方字数只作兜底：
+    # 它的统计口径和网页版渲染出来的正文并不一致，实测完整章节在 0.88~1.00 之间，
+    # 低于 min_content_ratio 只记录一行日志，低于 retry_content_ratio 才重采
+    min_content_ratio: float = 0.75
+    retry_content_ratio: float = 0.5
+    max_extract_attempts: int = 3
+    # 官方字数太少的章节（书名页、章名页）比例波动大，不做字数校验
+    min_check_words: int = 30
+
     def __init__(self, page: WeReadWebPage, save_dir: str) -> None:
         self._page: WeReadWebPage = page
         self._save_dir: str = save_dir
@@ -330,6 +340,15 @@ class WeReadExporter(object):
             fp.write(data)
 
     @staticmethod
+    def _content_chars(markdown_text: str) -> int:
+        """统计正文字符数，去掉图片链接与 markdown 标记，用于和官方字数比对"""
+        text = re.sub(r"!\[\]\([^)]*\)", "", markdown_text)
+        text = re.sub(r"```.*?```", "", text, flags=re.S)
+        text = re.sub(r"</?sup>|`", "", text)
+        text = re.sub(r"^#{1,6}\s*|^-{3,}\s*$", "", text, flags=re.M)
+        return len(re.findall(r"\S", text))
+
+    @staticmethod
     def _random_rest_point(rest_every: Tuple[float, float]) -> int:
         """返回再导出多少章后休息一次，0 表示不休息"""
         if rest_every[1] <= 0:
@@ -350,6 +369,7 @@ class WeReadExporter(object):
             await self.save_cover_image()
 
         exported = 0
+        incomplete: List[Tuple[str, int, int]] = []
         rest_point = self._random_rest_point(rest_every)
         for index, chapter in enumerate(meta_data["chapters"]):
             logging.info(
@@ -425,7 +445,13 @@ class WeReadExporter(object):
                     "Load chapter %s failed" % chapter["title"]
                 )
 
-            markdown_content = await self._page.get_markdown()
+            markdown_content, chars, complete = await self._extract_chapter(
+                chapter, timeout
+            )
+            if not complete:
+                incomplete.append(
+                    (chapter["title"], chars, int(chapter.get("words") or 0))
+                )
             logging.info(
                 "[%s] Export chapter %s to %s"
                 % (self.__class__.__name__, chapter["title"], file_path)
@@ -433,3 +459,92 @@ class WeReadExporter(object):
             with open(file_path, "wb") as fp:
                 fp.write(markdown_content.encode("utf-8", errors="replace"))
             exported += 1
+
+        if incomplete:
+            logging.warning(
+                "[%s] %d chapter(s) may be incomplete, delete their files under %s "
+                "and run again to retry:"
+                % (self.__class__.__name__, len(incomplete), self._chapter_dir)
+            )
+            for title, got, want in incomplete:
+                logging.warning(
+                    "[%s]   %s: %d chars / %d words"
+                    % (self.__class__.__name__, title, got, want)
+                )
+
+    async def _extract_chapter(
+        self, chapter: Dict[str, Any], timeout: int
+    ) -> Tuple[str, int, bool]:
+        """取回当前章节正文并校验完整性，不完整就重新加载重采
+
+        正文里有一部分元素随视口虚拟化，偶发漏采重新加载即可补齐。判断依据以
+        正文的纵向覆盖为准：钩子会检查内容容器里有没有既没有文字也没有图片、
+        代码块可以解释的空白区间，有空洞才说明真的漏了内容。
+        """
+        markdown_content: str = await self._page.get_markdown()
+        chars = self._content_chars(markdown_content)
+        gaps: List[List[int]] = self._page.last_content_gaps
+        words = int(chapter.get("words") or 0)
+        checked = words >= self.min_check_words
+
+        def too_short(value: int) -> bool:
+            return checked and value < words * self.retry_content_ratio
+
+        attempt = 1
+        while (gaps or too_short(chars)) and attempt < self.max_extract_attempts:
+            attempt += 1
+            logging.warning(
+                "[%s] Chapter %s looks incomplete (%d chars, %d gap(s)), retry %d/%d"
+                % (
+                    self.__class__.__name__,
+                    chapter["title"],
+                    chars,
+                    len(gaps),
+                    attempt,
+                    self.max_extract_attempts,
+                )
+            )
+            await asyncio.sleep(utils.random_seconds((3.0, 8.0)))
+            try:
+                await self._page.goto_chapter(chapter["id"], timeout=timeout)
+            except utils.LoginRequiredError:
+                # 重采途中登录态过期，扫码后再继续
+                logging.info(
+                    "[%s] Login required while retrying chapter %s"
+                    % (self.__class__.__name__, chapter["title"])
+                )
+                await self._page.login()
+                await self._page.goto_chapter(chapter["id"], timeout=timeout)
+            retried: str = await self._page.get_markdown()
+            retried_chars = self._content_chars(retried)
+            retried_gaps: List[List[int]] = self._page.last_content_gaps
+            if len(retried_gaps) < len(gaps) or (
+                len(retried_gaps) == len(gaps) and retried_chars > chars
+            ):
+                markdown_content, chars, gaps = retried, retried_chars, retried_gaps
+
+        ratio = chars / words if words else 0
+        if gaps:
+            logging.warning(
+                "[%s] Chapter %s still has %d content gap(s) after %d attempt(s): %s"
+                % (
+                    self.__class__.__name__,
+                    chapter["title"],
+                    len(gaps),
+                    attempt,
+                    gaps[:3],
+                )
+            )
+            return markdown_content, chars, False
+        if checked and chars < words * self.min_content_ratio:
+            # 覆盖完整但字数偏少：官方字数包含网页版不渲染的内容，例如纸书版权页
+            logging.info(
+                "[%s] Chapter %s coverage is complete, %d chars vs %d official words (%.2f)"
+                % (self.__class__.__name__, chapter["title"], chars, words, ratio)
+            )
+        else:
+            logging.info(
+                "[%s] Chapter %s content check passed: %d chars / %d words (%.2f)"
+                % (self.__class__.__name__, chapter["title"], chars, words, ratio)
+            )
+        return markdown_content, chars, True
