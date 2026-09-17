@@ -105,6 +105,33 @@ def check_cairo_installed() -> None:
         raise CairoNotInstalledError(install_msg)
 
 
+def parse_range(text: Union[str, int, float], name: str = "value") -> Tuple[float, float]:
+    """解析 "30" 或 "15-45" 形式的参数，返回 (min, max) 区间"""
+    if isinstance(text, (int, float)):
+        return float(text), float(text)
+    raw = str(text).strip()
+    parts = raw.split("-", 1) if "-" in raw else [raw, raw]
+    try:
+        low, high = float(parts[0]), float(parts[1])
+    except ValueError:
+        raise ValueError(
+            "Invalid %s %r, expect a number or a range like 15-45" % (name, raw)
+        )
+    if low < 0 or high < low:
+        raise ValueError(
+            "Invalid %s %r, expect 0 <= min <= max" % (name, raw)
+        )
+    return low, high
+
+
+def random_seconds(value_range: Tuple[float, float]) -> float:
+    """在区间内均匀随机取值，区间退化为单点时直接返回该值"""
+    low, high = value_range
+    if high <= low:
+        return low
+    return random.uniform(low, high)
+
+
 def generate_user_agent() -> str:
     user_agent_tmpl = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/%d.0.0.0 Safari/537.36"
     return user_agent_tmpl % random.randint(90, 130)

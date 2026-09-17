@@ -7,7 +7,7 @@ import logging
 import os
 import sys
 import time
-from typing import Dict, List, Optional, Any
+from typing import Dict, List, Optional, Any, Tuple
 
 import bs4
 import markdown
@@ -329,13 +329,28 @@ class WeReadExporter(object):
         with open(self._cover_image_path, "wb") as fp:
             fp.write(data)
 
-    async def export_markdown(self, timeout: int = 60, interval: int = 30) -> None:
+    @staticmethod
+    def _random_rest_point(rest_every: Tuple[float, float]) -> int:
+        """返回再导出多少章后休息一次，0 表示不休息"""
+        if rest_every[1] <= 0:
+            return 0
+        return max(1, int(round(utils.random_seconds(rest_every))))
+
+    async def export_markdown(
+        self,
+        timeout: int = 60,
+        interval: Tuple[float, float] = (30, 30),
+        rest_every: Tuple[float, float] = (0, 0),
+        rest_interval: Tuple[float, float] = (0, 0),
+    ) -> None:
         if not os.path.isdir(self._chapter_dir):
             os.makedirs(self._chapter_dir)
         meta_data = await self._load_meta_data()
         if not os.path.isfile(self._cover_image_path):
             await self.save_cover_image()
 
+        exported = 0
+        rest_point = self._random_rest_point(rest_every)
         for index, chapter in enumerate(meta_data["chapters"]):
             logging.info(
                 "[%s] Check chapter %s/%s"
@@ -349,6 +364,24 @@ class WeReadExporter(object):
                 "[%s] File %s not exist" % (self.__class__.__name__, file_path)
             )
 
+            # 两层随机等待：章节之间在区间内随机，每隔随机若干章再休息更久一次，
+            # 避免固定节奏。只在真正需要加载的章节之前等待，跳过的章节和最后一章之后不等
+            if exported > 0:
+                if rest_point and exported >= rest_point and rest_interval[1] > 0:
+                    seconds = utils.random_seconds(rest_interval)
+                    logging.info(
+                        "[%s] Take a rest for %.0fs after %d chapters"
+                        % (self.__class__.__name__, seconds, exported)
+                    )
+                    rest_point = exported + self._random_rest_point(rest_every)
+                else:
+                    seconds = utils.random_seconds(interval)
+                    logging.info(
+                        "[%s] Wait %.0fs before loading next chapter"
+                        % (self.__class__.__name__, seconds)
+                    )
+                await asyncio.sleep(seconds)
+
             time0 = 0
             for _ in range(3):
                 time0 = time.time()
@@ -359,7 +392,7 @@ class WeReadExporter(object):
                             timeout=timeout,
                         ),
                         timeout=timeout + 60,
-                    )  # avoid pyppeteer hangs
+                    )  # avoid browser hangs
                 except asyncio.TimeoutError:
                     logging.warning(
                         "[%s] Load chapter %s timeout %ds"
@@ -370,7 +403,15 @@ class WeReadExporter(object):
                         )
                     )
                     raise utils.LoadChapterFailedError()
-                except KeyboardInterrupt as ex:
+                except utils.LoginRequiredError:
+                    # 章节需要登录才能阅读，扫码登录后重试当前章节。
+                    # 等待扫码耗时较长，不能放在上面的 wait_for 超时保护之内
+                    logging.info(
+                        "[%s] Login required for chapter %s"
+                        % (self.__class__.__name__, chapter["title"])
+                    )
+                    await self._page.login()
+                except (KeyboardInterrupt, utils.BreakExportingError) as ex:
                     raise ex
                 except:
                     logging.exception(
@@ -391,5 +432,4 @@ class WeReadExporter(object):
             )
             with open(file_path, "wb") as fp:
                 fp.write(markdown_content.encode("utf-8", errors="replace"))
-
-            await asyncio.sleep(interval)
+            exported += 1

@@ -1,4 +1,6 @@
 const defaultFontColor = "rgb(208, 211, 216)";
+// 逐次 canvas 调用的调试日志每章有上万条，仅在 --debug 时输出
+const WR_DEBUG = !!window.__wereadDebug;
 function getPreElemList() {
   let preList = [];
   for (let div of document.getElementsByClassName("passage-content")) {
@@ -106,7 +108,7 @@ let canvasContextHandler = {
         return function (...args) {
           if (name == "fillText") {
             if (args[1] == 0) {
-              console.log(name, ...args, that.data.lastPos);
+              WR_DEBUG && console.log(name, ...args, that.data.lastPos);
             }
             if (args[0].startsWith("abcdefghijklmn")) {
               return target[name](...args);
@@ -138,7 +140,7 @@ let canvasContextHandler = {
               // new line
               that.checkElement(that.data.lastPos[1], args[2]);
 
-              console.log("font", that.data.fontSize, that.data.fontColor, that.data.fontColorChanged);
+              WR_DEBUG && console.log("font", that.data.fontSize, that.data.fontColor, that.data.fontColorChanged);
 
               if (that.data.fontSize >= 27) {
                 that.ensureHighlightClosed();
@@ -199,20 +201,20 @@ let canvasContextHandler = {
           } else if (name === "clearRect") {
             that.clearCanvasCache();
           } else {
-            console.log("call", name, args);
+            WR_DEBUG && console.log("call", name, args);
           }
           return target[name](...args);
         }
       } else {
         let value = target[name];
-        console.log("prop", name, value);
+        WR_DEBUG && console.log("prop", name, value);
         return value;
       }
     }
     return `Value for attribute ${name}`
   },
   set(target, name, value) {
-    console.log("set", name, value);
+    WR_DEBUG && console.log("set", name, value);
     if (name === "font") {
       let fontSize = 0;
       for (let it of value.split(" ")) {
@@ -260,7 +262,7 @@ let canvasContextHandler = {
 
 let origGetContext = HTMLCanvasElement.prototype.getContext;
 HTMLCanvasElement.prototype.getContext = function (s) {
-  console.log("getContext", s);
+  WR_DEBUG && console.log("getContext", s);
   ctx = origGetContext.call(this, s);
   canvasContextHandler.data.preList = getPreElemList();
   canvasContextHandler.data.imgList = getImgElemList();
@@ -268,3 +270,5 @@ HTMLCanvasElement.prototype.getContext = function (s) {
   let p = new Proxy(ctx, canvasContextHandler);
   return p;
 }
+// 钩子脚本会被包在块作用域中注入，显式挂到 window 上供 page.evaluate 访问
+window.canvasContextHandler = canvasContextHandler;

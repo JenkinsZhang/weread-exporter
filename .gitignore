@@ -1,24 +1,36 @@
-build/
+# 运行期数据：浏览器 profile、登录态、抓取的书籍缓存和导出文件，含敏感信息，切勿提交
+# Runtime data: browser profile, login state, crawled books and exported files. Never commit.
 cache/
-dist/
 output/
+chrome-profile/
+storage_state.json
+cookie.txt
+webpage.html
+screenshot.jpg
 *.epub
 *.pdf
-*.md
+*.mobi
 *.log
-*.egg-info/
+*.md
+!README.md
 
 # Python
+build/
+dist/
+*.egg-info/
 *.pyc
 *.pyo
 *.pyd
 __pycache__/
 *.so
 *.egg
-*.egg-info/
 .Python
 .env
 .venv
 env/
 venv/
 ENV/
+
+# IDE
+.idea/
+.vscode/

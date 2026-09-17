@@ -1,30 +1,34 @@
 """
 WebRead WebPage
+
+基于 Playwright 驱动 Chrome 打开微信读书网页版：维护登录态、导航阅读页、
+并从注入的 Canvas 钩子中取回章节 markdown。
 """
 
 import asyncio
 import json
 import logging
 import os
-import random
-import re
-import subprocess
-import sys
-import tempfile
 import time
-import urllib.parse
-from typing import Dict, List, Optional, Union, Any, Tuple, cast
+from typing import Any, Dict, List, Optional, Tuple
 
-import pyppeteer
+from playwright.async_api import (
+    BrowserContext,
+    ConsoleMessage,
+    Error as PlaywrightError,
+    Page,
+    Playwright,
+    Route,
+    TimeoutError as PlaywrightTimeoutError,
+    async_playwright,
+)
 
-from . import webproxy
 from . import utils
 
-if sys.version_info >= (3, 8):
-    from typing import TYPE_CHECKING
-else:
-    from typing_extensions import TYPE_CHECKING
 
+HOOK_SCRIPT_PATH: str = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "hook.js"
+)
 
 DETECT_HEADLESS_SCRIPT = """
 const webdriver = navigator.webdriver === true;
@@ -37,37 +41,70 @@ webdriver || !chromeObj || pluginCount === 0 || languageCount === 0  || headless
 """
 
 
+class HorizontalReaderError(RuntimeError):
+    """阅读页处于横向翻页模式，无法按章导出"""
+
+
 class WeReadWebPage(object):
     """WebRead WebPage"""
 
     root_url: str = "https://weread.qq.com"
     window_size: Tuple[int, int] = (1920, 1080)
+    # 埋点/日志上报接口：直接返回成功，避免真实上报，也减少无关请求
+    telemetry_url_patterns: Tuple[str, ...] = (
+        "**/hera/**",
+        "**/sentry/**",
+        "**/river/single**",
+    )
+    # 书籍详情页与阅读页上可能出现的登录入口
+    login_button_selectors: Tuple[str, ...] = (
+        "button.navBar_link_Login",
+        "div.readerTopBar_right button.actionItem",
+        "button.readerFooter_button",
+        "button:has-text('登录')",
+    )
 
     def __init__(
         self,
         book_id: str,
-        cookie_path: Optional[str] = None,
+        profile_dir: Optional[str] = None,
         webcache_path: Optional[str] = None,
+        debug: bool = False,
     ) -> None:
         self._book_id: str = book_id
-        self._cookie_path: Optional[str] = cookie_path
-        self._cookie: Dict[str, str] = {}
+        self._debug: bool = debug
         self._webcache_path: str = webcache_path or "cache"
         if not os.path.isdir(self._webcache_path):
             os.makedirs(self._webcache_path)
+        # 固定的浏览器 profile 目录：登录态（包括服务端轮换的 wr_skey）由浏览器
+        # 自己保存和续期，多次运行之间不会丢失
+        self._profile_dir: str = os.path.abspath(
+            profile_dir or os.path.join(self._webcache_path, "chrome-profile")
+        )
+        # 登录成功后额外备份一份 cookie，profile 损坏或被删除时可以恢复
+        self._storage_state_path: str = os.path.join(
+            self._webcache_path, "storage_state.json"
+        )
+        self._console_log_path: str = os.path.join(
+            self._webcache_path, book_id, "console.log"
+        )
         self._home_url: str = "%s/web/bookDetail/%s" % (
             self.__class__.root_url,
             book_id,
         )
         self._chapter_root_url: str = self.__class__.root_url + "/web/reader/"
-        self._hook_script_name: str = "1.%s.js" % "".join(
-            [random.choice("0123456789abcdef") for _ in range(8)]
-        )
-        self._browser: Optional[pyppeteer.browser.Browser] = None
-        self._page: Optional[pyppeteer.page.Page] = None
-        self._load_cookie()
+        self._playwright: Optional[Playwright] = None
+        self._context: Optional[BrowserContext] = None
+        self._page: Optional[Page] = None
+        self._console_log: Optional[Any] = None
+        self._headless: bool = False
+        self._user_name: str = ""
         self._url: str = ""
-        self._proxy_installed: bool = False
+
+    @property
+    def user_name(self) -> str:
+        """当前登录用户名，未登录为空串"""
+        return self._user_name
 
     async def get_book_info(self) -> Dict[str, Any]:
         html = (await utils.fetch(self._home_url)).decode()
@@ -98,527 +135,372 @@ class WeReadWebPage(object):
             book_info["chapters"].append(chap)
         return book_info
 
-    async def get_user_info(self) -> Dict[str, Any]:
-        vid: str = self._cookie.get("wr_vid", "")
-        if not vid:
-            raise utils.InvalidUserError("Invalid cookie: %s" % self._format_cookie())
-        url: str = "%s/web/user?userVid=%s" % (self.__class__.root_url, vid)
-        headers: Dict[str, str] = {
-            "Referer": self.__class__.root_url,
-            "Cookie": self._format_cookie(),
-        }
-        rsp: bytes = await utils.fetch(url, headers=headers)
-        rsp_data = json.loads(rsp.decode())
-        if rsp_data.get("errCode") == -2012:
-            result = await utils.fetch(
-                self.__class__.root_url, headers=headers, respond_with_headers=True
-            )
-            _, rsp_headers, _ = cast(Tuple[int, Dict[str, str], bytes], result)
-            for it in rsp_headers.getall("Set-Cookie", []):
-                cookie = it.split("; ")[0]
-                if "=" not in cookie:
-                    logging.warning(
-                        "[%s] Ignore invalid cookie: %s"
-                        % (self.__class__.__name__, cookie)
-                    )
-                    continue
-                key, value = cookie.split("=", 1)
-                self._cookie[key] = value
-                logging.info(
-                    "[%s] Update cookie %s" % (self.__class__.__name__, cookie)
-                )
-            self._save_cookie()
-            headers["Cookie"] = self._format_cookie()
-            rsp = await utils.fetch(url, headers=headers)
-            rsp_data = json.loads(rsp.decode())
-        elif rsp_data.get("errCode") == -2010:
-            # 用户不存在
-            raise utils.InvalidUserError("User %s not found" % vid)
-        elif rsp_data.get("errCode"):
-            raise RuntimeError("Get user info failed: %s" % rsp_data)
-        return rsp_data
-
-    def _load_cookie(self) -> None:
-        self._cookie = {}
-        if not self._cookie_path or not os.path.isfile(self._cookie_path):
-            return
-        with open(self._cookie_path) as fp:
-            cookie = fp.read()
-            try:
-                cookie_data: Dict[str, str] = json.loads(cookie)
-            except:
-                for it in cookie.split(";"):
-                    it = it.strip()
-                    if "=" not in it:
-                        continue
-                    key, value = it.split("=", 1)
-                    self._cookie[key] = value
-            else:
-                for key in cookie_data:
-                    self._cookie[key] = cookie_data[key]
-
-    def _save_cookie(self) -> None:
-        if not self._cookie_path:
-            return
-        with open(self._cookie_path, "w") as fp:
-            fp.write(json.dumps(self._cookie))
-
-    def _format_cookie(self, cookie: str = "") -> str:
-        cookies: List[str] = []
-        if cookie:
-            cookies.append(cookie)
-        for key in self._cookie:
-            cookies.append("%s=%s" % (key, self._cookie[key]))
-        return "; ".join(cookies)
-
-    async def _read_cookie(self) -> Dict[str, str]:
-        cookies = await self._page.cookies()
-        cookie_map = {}
-        for cookie in cookies:
-            cookie_map[cookie["name"]] = cookie["value"]
-        return cookie_map
-
-    async def _update_cookie(self) -> None:
-        self._cookie = await self._read_cookie()
-
     async def check_valid(self) -> bool:
         html = await utils.fetch(self._home_url)
         if b'"soldout":1' in html:
             return False
         return True
 
-    def _check_chrome(self) -> str:
-        path_list = os.environ["PATH"].split(";" if sys.platform == "win32" else ":")
-        for chrome in ("chrome", "google-chrome", "google-chrome-stable"):
-            if sys.platform == "win32":
-                chrome += ".exe"
-            for path in path_list:
-                if os.path.isfile(os.path.join(path, chrome)):
-                    return chrome
-
-        if sys.platform == "darwin":
-            chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-            if os.path.isfile(chrome):
-                return chrome
-
-        if sys.platform == "win32":
-            command = "where chrome"
-        else:
-            command = "which chrome"
-        raise utils.ChromeNotInstalledError(
-            "Please make sure `chrome` is installed, and the install path is added to PATH environment. \nYou can test that with `%s` command."
-            % command
-        )
-
-    def _get_chrome_version(self, chrome_path: str) -> Optional[int]:
-        """获取 Chrome 版本号的主版本号"""
-        try:
-            # 尝试获取 Chrome 版本
-            result = subprocess.run(
-                [chrome_path, "--version"], capture_output=True, text=True, timeout=10
-            )
-            if result.returncode == 0:
-                # 解析版本号，格式通常是 "Google Chrome 136.0.6776.0" 或 "Chromium 136.0.6776.0"
-                version_match = re.search(r"(\d+)\.", result.stdout)
-                if version_match:
-                    return int(version_match.group(1))
-        except (
-            subprocess.TimeoutExpired,
-            subprocess.SubprocessError,
-            FileNotFoundError,
-            ValueError,
-        ):
-            # 如果获取版本失败，返回 None
-            pass
-        return None
-
     async def launch(
         self,
         headless: bool = False,
         force_login: bool = False,
-        use_default_profile: bool = False,
-        mock_user_agent: bool = False,
+        allow_guest: bool = False,
         proxy_server: Optional[str] = None,
     ) -> None:
         logging.info("[%s] Launch url %s" % (self.__class__.__name__, self._home_url))
-        chrome: str = self._check_chrome()
+        self._headless = headless
+        if not os.path.isdir(self._profile_dir):
+            os.makedirs(self._profile_dir)
+        logging.info(
+            "[%s] Use profile dir %s" % (self.__class__.__name__, self._profile_dir)
+        )
 
-        # 检查 Chrome 版本并在使用默认 profile 时发出警告
-        if use_default_profile:
-            chrome_version = self._get_chrome_version(chrome)
-            if chrome_version is not None and chrome_version >= 136:
-                logging.warning(
-                    "[%s] Chrome %d detected. Chrome 136+ no longer supports using default profile. Consider using --use-default-profile=false to avoid potential issues."
-                    % (self.__class__.__name__, chrome_version)
+        launch_kwargs: Dict[str, Any] = {
+            "user_data_dir": self._profile_dir,
+            "headless": headless,
+            "no_viewport": True,
+            "args": [
+                "--window-size=%d,%d" % self.__class__.window_size,
+                "--disable-blink-features=AutomationControlled",
+            ],
+            "ignore_default_args": ["--enable-automation"],
+        }
+        if proxy_server:
+            launch_kwargs["proxy"] = {"server": proxy_server}
+
+        self._playwright = await async_playwright().start()
+        try:
+            # 优先使用本机安装的 Chrome，无需额外下载浏览器
+            self._context = await self._playwright.chromium.launch_persistent_context(
+                channel="chrome", **launch_kwargs
+            )
+        except PlaywrightError as ex:
+            logging.warning(
+                "[%s] Launch system chrome failed: %s, fallback to bundled chromium"
+                % (self.__class__.__name__, str(ex).splitlines()[0])
+            )
+            try:
+                self._context = (
+                    await self._playwright.chromium.launch_persistent_context(
+                        **launch_kwargs
+                    )
+                )
+            except PlaywrightError:
+                await self.close()
+                raise utils.ChromeNotInstalledError(
+                    "Chrome not found. Please install Google Chrome, "
+                    "or run `playwright install chromium` to download a browser."
                 )
 
-        args = ["--no-first-run", "--remote-allow-origins=*"]
-        if headless:
-            args.append("--headless=new")
-            if sys.platform == "linux" and os.getuid() == 0:
-                args.append("--no-sandbox")
-        if use_default_profile:
-            args.append("--user-data-dir")
-        else:
-            args.append("--window-size=%d,%d" % self.__class__.window_size)
-            args.append("--user-data-dir=%s" % tempfile.mkdtemp())
-        if mock_user_agent:
-            args.append('--user-agent="%s"' % utils.generate_user_agent())
-        if proxy_server:
-            args.append("--proxy-server=%s" % proxy_server)
-        args.append("about:blank")
-        logging.info(
-            "[%s] Chrome args: chrome %s" % (self.__class__.__name__, " ".join(args))
+        self._page = (
+            self._context.pages[0]
+            if self._context.pages
+            else await self._context.new_page()
         )
-        self._browser = await pyppeteer.launch(
-            executablePath=chrome,
-            ignoreDefaultArgs=True,
-            args=args,
-            defaultViewport=None,
-            logLevel=logging.INFO,
-        )
-        self._page = (await self._browser.pages())[0]
-        await self._page.evaluateOnNewDocument(
-            """() => {
-            if (navigator.webdriver) {
-                Object.defineProperty(navigator, 'webdriver', {
-                    get: () => {
-                        console.log('navigator.webdriver is called');
-                        console.log(new Error().stack);
-                        return undefined;
-                    }
-                });
-                var _hasOwnProperty = Object.prototype.hasOwnProperty;
-                Object.prototype.hasOwnProperty = function (key) {
-                    if (key === 'webdriver') {
-                        console.log('hasOwnProperty', key, 'is called');
-                        console.log(new Error().stack);
-                        return false;
-                    }
-                    return _hasOwnProperty.call(this, key);
-                };
-                const originalQuery = navigator.permissions.query;
-                navigator.permissions.query = (parameters) => (
-                    parameters.name === 'notifications' ?
-                    Promise.resolve({ state: Notification.permission }) :
-                    originalQuery(parameters)
-                );
-            }
-            if (navigator.plugins.length === 0) {
-                Object.defineProperty(navigator, 'plugins', {
-                    get: () => [1, 2, 3, 4, 5],
-                });
-                Object.defineProperty(window, 'PluginArray', {
-                    get: () => Array,
-                });
-            }
-            if (navigator.languages.length === 0) {
-                Object.defineProperty(navigator, 'languages', {
-                    get: () => ['en-US', 'en'],
-                });
-            }
-            window.chrome = window.chrome || {
-                runtime: {},
-            };
-        }
-        """
-        )
+        await self._context.add_init_script(script=self._build_hook_script())
+        for pattern in self.__class__.telemetry_url_patterns:
+            await self._context.route(pattern, self._handle_telemetry)
+        await self._add_reader_mode_cookie()
 
-        await self._page.setViewport(
-            {
-                "width": 0,
-                "height": 0,
-                "deviceScaleFactor": 0.3,
-            }
-        )
+        if self._debug:
+            # hook.js 每章会产生上万条 console 输出，只在调试时才收集
+            log_dir = os.path.dirname(self._console_log_path)
+            if not os.path.isdir(log_dir):
+                os.makedirs(log_dir)
+            self._console_log = open(self._console_log_path, "a", encoding="utf-8")
+            self._page.on("console", self._handle_console)
+
+        await self._restore_storage_state()
+        await self._page.goto(self._home_url, wait_until="domcontentloaded")
+
         detect_headless_result = await self._page.evaluate(DETECT_HEADLESS_SCRIPT)
         if detect_headless_result:
-            key = input("浏览器检测到Headless模式，继续执行可能导致帐号被封禁，是否继续执行？Y/n\n")
-            if key != "Y":
+            key = await self._ainput(
+                "浏览器检测到Headless模式，继续执行可能导致帐号被封禁，是否继续执行？Y/n\n"
+            )
+            if key.strip() != "Y":
                 raise utils.BreakExportingError()
 
-        if self._cookie.get("wr_vid"):
-            try:
-                user_info = await self.get_user_info()
-            except utils.InvalidUserError as ex:
-                logging.warning(
-                    "[%s] Get user error: %s" % (self.__class__.__name__, ex)
-                )
-                self._cookie = {}
-            else:
-                logging.info(
-                    "[%s] Current login user is %s"
-                    % (self.__class__.__name__, user_info.get("name", "Anonymous"))
-                )
-        if self._cookie:
-            await self._inject_cookie()
-
-        await self._page.goto(self._home_url)
-        # await self.wait_for_selector("div.readerFooter a")
-        if force_login:
-            await self.login()
-        if self._cookie:
-            await self.wait_for_avatar()
-        self._page.on("console", self.handle_log)
+        await self._ensure_login(force_login, allow_guest)
 
     async def close(self) -> None:
-        if self._browser:
-            await self._browser.close()
-            self._browser = self._page = None
+        if self._console_log:
+            self._console_log.close()
+            self._console_log = None
+        if self._context:
+            try:
+                await self._context.close()
+            except PlaywrightError as ex:
+                logging.warning(
+                    "[%s] Close browser failed: %s" % (self.__class__.__name__, ex)
+                )
+        if self._playwright:
+            await self._playwright.stop()
+        self._context = self._page = self._playwright = None
+
+    async def _ensure_login(self, force_login: bool, allow_guest: bool) -> None:
+        user_name = await self.get_login_user()
+        if user_name and not force_login:
+            self._user_name = user_name
+            logging.info(
+                "[%s] Current login user is %s" % (self.__class__.__name__, user_name)
+            )
+            print("当前登录用户：%s" % user_name, flush=True)
+            return
+        if force_login:
+            logging.info(
+                "[%s] Force login, clear current login state" % self.__class__.__name__
+            )
+            await self._clear_login()
+        elif allow_guest:
+            logging.warning(
+                "[%s] Not logged in, export as guest (only preview chapters available)"
+                % self.__class__.__name__
+            )
+            print("当前未登录，将以游客身份导出（只能导出试读章节）", flush=True)
+            return
+        await self.login()
+
+    async def login(self, timeout: int = 300) -> str:
+        """打开登录二维码并等待用户扫码，成功后返回用户名"""
+        if self._headless:
+            raise utils.LoginRequiredError(
+                "未登录：headless 模式下无法扫码，请先不带 --headless 运行一次完成登录"
+            )
+        if await self._open_login_dialog():
+            print("请在浏览器弹出的二维码窗口中用微信扫码登录，登录成功后会自动继续...", flush=True)
+        else:
+            print("未能自动打开登录窗口，请在浏览器中手动点击「登录」并扫码，登录成功后会自动继续...", flush=True)
+        time0 = time.time()
+        while time.time() - time0 < timeout:
+            await asyncio.sleep(2)
+            user_name = await self.get_login_user()
+            if not user_name:
+                continue
+            self._user_name = user_name
+            logging.info(
+                "[%s] Login success, user is %s" % (self.__class__.__name__, user_name)
+            )
+            print("登录成功：%s" % user_name, flush=True)
+            await self._save_storage_state()
+            return user_name
+        raise utils.LoginRequiredError("登录超时（%d 秒）" % timeout)
+
+    async def get_login_user(self) -> str:
+        """校验浏览器中的登录态，返回用户名，未登录返回空串"""
+        cookies = await self._context.cookies(self.__class__.root_url)
+        vid = next((it["value"] for it in cookies if it["name"] == "wr_vid"), "")
+        if not vid:
+            return ""
+        url = "%s/web/user?userVid=%s" % (self.__class__.root_url, vid)
+        for attempt in range(2):
+            try:
+                # context.request 与浏览器共享 cookie，不需要手工拼 Cookie 头
+                rsp = await self._context.request.get(
+                    url, headers={"Referer": self.__class__.root_url}
+                )
+                rsp_data = await rsp.json()
+            except (PlaywrightError, ValueError) as ex:
+                logging.warning(
+                    "[%s] Get user info failed: %s" % (self.__class__.__name__, ex)
+                )
+                return ""
+            err_code = rsp_data.get("errCode")
+            if err_code == -2012 and attempt == 0:
+                # 登录态需要续期，页面脚本会用 wr_rt 刷新 wr_skey，刷新页面后重试
+                await self._page.reload(wait_until="domcontentloaded")
+                await asyncio.sleep(2)
+                continue
+            if err_code:
+                logging.warning(
+                    "[%s] Login state invalid: %s" % (self.__class__.__name__, rsp_data)
+                )
+                return ""
+            return rsp_data.get("name") or "Anonymous"
+        return ""
+
+    def _login_dialog_opened(self) -> bool:
+        # 登录弹窗会把微信扫码页以 iframe 形式嵌入
+        return any("open.weixin.qq.com" in frame.url for frame in self._page.frames)
+
+    async def _wait_for_login_dialog(self, timeout: float = 5) -> bool:
+        time0 = time.time()
+        while time.time() - time0 < timeout:
+            if self._login_dialog_opened():
+                return True
+            await asyncio.sleep(0.5)
+        return False
+
+    async def _open_login_dialog(self, retries: int = 3) -> bool:
+        """点击登录入口并确认二维码窗口已经出现"""
+        for _ in range(retries):
+            if self._login_dialog_opened():
+                return True
+            if not await self._click_login_button():
+                await asyncio.sleep(1)
+                continue
+            if await self._wait_for_login_dialog():
+                return True
+        return self._login_dialog_opened()
+
+    async def _click_login_button(self) -> bool:
+        for selector in self.__class__.login_button_selectors:
+            locator = self._page.locator(selector)
+            try:
+                count = await locator.count()
+            except PlaywrightError:
+                continue
+            for index in range(count):
+                item = locator.nth(index)
+                try:
+                    if not await item.is_visible():
+                        continue
+                    text = (await item.inner_text()).strip()
+                    if "登录" not in text:
+                        continue
+                    # 弹窗遮罩可能拦住按钮，缩短超时避免长时间卡住
+                    await item.click(timeout=5000)
+                except PlaywrightError as ex:
+                    logging.debug(
+                        "[%s] Click %s failed: %s"
+                        % (self.__class__.__name__, selector, ex)
+                    )
+                    continue
+                return True
+        return False
+
+    async def _clear_login(self) -> None:
+        await self._context.clear_cookies()
+        await self._add_reader_mode_cookie()
+        if os.path.isfile(self._storage_state_path):
+            os.remove(self._storage_state_path)
+        await self._page.reload(wait_until="domcontentloaded")
+
+    async def _add_reader_mode_cookie(self) -> None:
+        # 强制阅读页使用非横向翻页模式，hook.js 的排版还原依赖该模式下的绘制方式
+        await self._context.add_cookies(
+            [
+                {
+                    "name": "wr_useHorizonReader",
+                    "value": "0",
+                    "domain": "weread.qq.com",
+                    "path": "/",
+                }
+            ]
+        )
+
+    async def _save_storage_state(self) -> None:
+        await self._context.storage_state(path=self._storage_state_path)
+        logging.info(
+            "[%s] Login state saved to %s"
+            % (self.__class__.__name__, self._storage_state_path)
+        )
+
+    async def _restore_storage_state(self) -> None:
+        """profile 中没有登录态但存在备份时，从备份恢复 cookie"""
+        if not os.path.isfile(self._storage_state_path):
+            return
+        cookies = await self._context.cookies(self.__class__.root_url)
+        if any(it["name"] == "wr_vid" for it in cookies):
+            return
+        try:
+            with open(self._storage_state_path, encoding="utf-8") as fp:
+                state = json.load(fp)
+        except (OSError, ValueError) as ex:
+            logging.warning(
+                "[%s] Load %s failed: %s"
+                % (self.__class__.__name__, self._storage_state_path, ex)
+            )
+            return
+        saved: List[Dict[str, Any]] = [
+            it
+            for it in state.get("cookies", [])
+            if "weread.qq.com" in it.get("domain", "")
+        ]
+        if not saved:
+            return
+        await self._context.add_cookies(saved)
+        logging.info(
+            "[%s] Restore %d cookies from %s"
+            % (self.__class__.__name__, len(saved), self._storage_state_path)
+        )
+
+    def _build_hook_script(self) -> str:
+        with open(HOOK_SCRIPT_PATH, encoding="utf-8") as fp:
+            hook_script = fp.read()
+        # 只在阅读页启用 canvas 钩子，详情页和登录二维码 iframe 不受影响；
+        # __wereadDebug 控制 hook.js 是否输出逐次 canvas 调用的调试日志
+        return (
+            "window.__wereadDebug = %s;\n"
+            "if (location.pathname.startsWith('/web/reader/')) {\n%s\n}\n"
+        ) % ("true" if self._debug else "false", hook_script)
+
+    async def _handle_telemetry(self, route: Route) -> None:
+        request = route.request
+        if request.method == "POST" and request.post_data:
+            logging.debug(
+                "[%s] %s %s %s"
+                % (self.__class__.__name__, request.method, request.url, request.post_data)
+            )
+        headers = {
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "*",
+            "Access-Control-Allow-Headers": "*",
+        }
+        body = '{"err_code":0,"msg":"suc"}' if "/river/single" in request.url else ""
+        try:
+            await route.fulfill(status=200, headers=headers, body=body)
+        except PlaywrightError:
+            # 页面已跳转或关闭，请求不再需要响应
+            pass
+
+    def _handle_console(self, message: ConsoleMessage) -> None:
+        # hook.js 会输出大量 canvas 调用日志，只落盘不打到终端
+        if not self._console_log:
+            return
+        try:
+            self._console_log.write("[%s] %s\n" % (self._url, message.text))
+        except (OSError, ValueError):
+            pass
+
+    async def _ainput(self, prompt: str) -> str:
+        # input() 会阻塞事件循环，放到线程池中执行
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, input, prompt)
 
     async def get_html(self) -> str:
         return await self._page.evaluate("document.documentElement.outerHTML;")
 
     async def screenshot(self, save_path: str) -> None:
-        await self._page.screenshot({"path": save_path})
+        await self._page.screenshot(path=save_path)
 
-    async def wait_for_selector(self, selector: str, timeout: int = 30) -> Any:
-        try:
-            return await self._page.waitForSelector(selector, timeout=timeout * 1000)
-        except pyppeteer.errors.TimeoutError as ex:
-            html = await self.get_html()
-            html_path = "webpage.html"
-            with open(html_path, "wb") as fp:
-                if not isinstance(html, bytes):
-                    html = html.encode("utf8")
-                fp.write(html)
-            logging.info(
-                "[%s] Current html saved to %s" % (self.__class__.__name__, html_path)
-            )
-            screenshot_path = "screenshot.jpg"
-            await self.screenshot(screenshot_path)
-            logging.info(
-                "[%s] Current screenshot saved to %s"
-                % (self.__class__.__name__, screenshot_path)
-            )
-            raise ex
-
-    def handle_log(self, message: Any) -> None:
-        text = message.text
-        logging.info("[%s][Console] %s" % (self.__class__.__name__, text))
-        with open("%s.log" % self._book_id, "a+", encoding="utf-8") as fp:
-            fp.write("[%s] %s\n" % (self._url, text))
-
-    async def wait_for_avatar(self, timeout: int = 30) -> None:
-        time0 = time.time()
-        while time.time() - time0 < timeout:
-            avatar_url = await self._page.evaluate(
-                "document.querySelector('img.wr_avatar_img') && document.querySelector('img.wr_avatar_img').getAttribute('src');"
-            )
-            if avatar_url is None or not avatar_url.endswith("Default.svg"):
-                break
-            await asyncio.sleep(5)
-        else:
-            raise RuntimeError("Wait for avatar timeout")
-
-    async def _inject_cookie(self) -> None:
-        for key in self._cookie:
-            logging.info(
-                "[%s] Inject cookie %s=%s"
-                % (self.__class__.__name__, key, self._cookie[key])
-            )
-            await self._page.setCookie(
-                {
-                    "url": self.__class__.root_url,
-                    "name": key,
-                    "value": self._cookie[key],
-                    "secure": True,
-                }
-            )
-
-    async def login(self) -> bool:
-        selectors = [
-            "button.navBar_link_Login",
-            "div.readerTopBar_right button.actionItem",
-        ]
-        for selector in selectors:
-            script = (
-                "var elem = document.querySelector('%s'); elem && elem.innerText"
-                % (selector)
-            )
-            result = await self._page.evaluate(script)
-            if not result:
-                continue
-            if "登录" not in result:
-                continue
-            await self._page.click(selector)
-            script = "document.querySelector('div.menu_container img.wr_avatar_img')"
-            time0 = time.time()
-            while time.time() - time0 < 300:
-                logging.info("[%s] Waiting for login" % self.__class__.__name__)
-                await asyncio.sleep(10)
-                result = await self._page.evaluate(script)
-                if not result:
-                    continue
-                logging.info("[%s] Login success" % self.__class__.__name__)
-                await self._update_cookie()
-                self._save_cookie()
-                return True
-            else:
-                raise RuntimeError("Login timeout")
-        return False
-
-    async def _get_from_cache_or_server(
-        self, url: str, headers: Optional[Dict[str, str]] = None
-    ) -> Tuple[int, Dict[str, str], bytes]:
-        u: urllib.parse.ParseResult = urllib.parse.urlparse(url)
-        path = os.path.join(
-            self._webcache_path, "resources", u.path[1:].replace("/", os.sep)
+    async def _dump_page_state(self) -> None:
+        html_path = os.path.join(self._webcache_path, "webpage.html")
+        with open(html_path, "w", encoding="utf-8") as fp:
+            fp.write(await self.get_html())
+        logging.info(
+            "[%s] Current html saved to %s" % (self.__class__.__name__, html_path)
         )
-        if os.path.isfile(path):
-            logging.info(
-                "[%s] Url %s hit cache %d"
-                % (self.__class__.__name__, url, os.path.getsize(path))
-            )
-            with open(path, "rb") as fp:
-                return 200, {}, fp.read()
-
-        dirpath = os.path.dirname(path)
-        if not os.path.isdir(dirpath):
-            os.makedirs(dirpath)
-        result = await utils.fetch(url, headers=headers, respond_with_headers=True)
-        # 当 respond_with_headers=True 时，返回类型确定是 Tuple[int, Dict[str, str], bytes]
-        status, headers_resp, body = cast(Tuple[int, Dict[str, str], bytes], result)
-        logging.info("[%s] Url %s return %d" % (self.__class__.__name__, url, status))
-        if status == 200:
-            with open(path, "wb") as fp:
-                fp.write(body)
-        return status, headers_resp, body
-
-    def _log_request(self, request: "webproxy.WebRequest") -> None:
-        if request.method == "POST":
-            message = "[%s] %s %s" % (
-                self.__class__.__name__,
-                request.method,
-                request.url,
-            )
-            if request.body:
-                message += " %s" % request.content
-            logging.info(message)
-
-    def on_document_request(self, request: "webproxy.WebRequest") -> Dict[str, Any]:
-        """ """
-        cookie = request.headers.get("cookie", "")
-        cookie += "; wr_useHorizonReader=0"
-        request.headers["cookie"] = cookie
-        return {"type": webproxy.EnumProxyType.Continue, "headers": request.headers}
-
-    def on_document_response(self, response: "webproxy.WebResponse") -> Dict[str, Any]:
-        content = response.content
-        inject_script = (
-            "<script src='https://cdn.weread.qq.com/web/%s'></script>\n"
-            % self._hook_script_name
+        screenshot_path = os.path.join(self._webcache_path, "screenshot.jpg")
+        await self.screenshot(screenshot_path)
+        logging.info(
+            "[%s] Current screenshot saved to %s"
+            % (self.__class__.__name__, screenshot_path)
         )
-        content = content.replace("</head>", inject_script + "</head>")
-        return {
-            "status": response.status,
-            "headers": response.headers,
-            "body": content.encode("utf-8"),
-        }
-
-    def on_hook_script_request(self, request: "webproxy.WebRequest") -> Dict[str, Any]:
-        with open(
-            os.path.join(os.path.dirname(os.path.abspath(__file__)), "hook.js"),
-            "rb",
-        ) as fp:
-            hook_script = fp.read()
-            return {
-                "type": webproxy.EnumProxyType.Mock,
-                "status": 200,
-                "headers": {"Content-Type": "application/json"},
-                "body": hook_script,
-            }
-
-    def on_log_request(self, request: "webproxy.WebRequest") -> Dict[str, Any]:
-        self._log_request(request)
-        headers = {
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Request-Method": "*",
-            "Access-Control-Allow-Headers": "*",
-        }
-        if request.method == "OPTIONS":
-            return {
-                "type": webproxy.EnumProxyType.Mock,
-                "status": 200,
-                "headers": headers,
-            }
-        if "/hera/logkv" in request.url or "/hera/osslog" in request.url:
-            return {
-                "type": webproxy.EnumProxyType.Mock,
-                "status": 204,
-                "headers": headers,
-            }
-        elif "chlog" in request.url:
-            logging.info("[%s] Url %s return mock result" % (self.__class__.__name__, request.url))
-            return {
-                "type": webproxy.EnumProxyType.Mock,
-                "status": 200,
-                "headers": headers,
-            }
-        return {"type": webproxy.EnumProxyType.Block}
-
-    def on_sentry_request(self, request: "webproxy.WebRequest") -> Dict[str, Any]:
-        self._log_request(request)
-        return {
-            "type": webproxy.EnumProxyType.Mock,
-            "status": 200,
-        }
-
-    def on_single_report_request(
-        self, request: "webproxy.WebRequest"
-    ) -> Dict[str, Any]:
-        self._log_request(request)
-        return {
-            "type": webproxy.EnumProxyType.Mock,
-            "status": 200,
-            "headers": {
-                "Access-Control-Allow-Origin": "*",
-                "Access-Control-Request-Method": "*",
-                "Access-Control-Allow-Headers": "*",
-            },
-            "body": '{"err_code":0,"msg":"suc"}',
-        }
-
-    def on_chapter_request(self, request: "webproxy.WebRequest") -> Dict[str, Any]:
-        return {"type": webproxy.EnumProxyType.Continue}
-
-    async def pre_load_page(self) -> None:
-        if self._proxy_installed:
-            return
-        self._proxy_installed = True
-        # await self._page.setRequestInterception(True)
-        rules = [
-            webproxy.ProxyRule("*/hera/*", self.on_log_request),
-            webproxy.ProxyRule("*/sentry/*", self.on_sentry_request),
-            webproxy.ProxyRule("*/web/book/chapter/*", self.on_chapter_request),
-            webproxy.ProxyRule("*/river/single*", self.on_single_report_request),
-            webproxy.ProxyRule(
-                "*/web/reader/*", self.on_document_request, resource_type="Document"
-            ),
-            webproxy.ProxyRule(
-                "*/web/reader/*",
-                self.on_document_response,
-                resource_type="Document",
-                stage=webproxy.EnumProxyStage.Response,
-            ),
-            webproxy.ProxyRule(
-                "*/web/%s" % self._hook_script_name,
-                self.on_hook_script_request,
-                resource_type="Script",
-            ),
-        ]
-        proxy = webproxy.WebProxy(self._page, rules)
-        await proxy.setup_interception()
-        # self._page.on("request", self.handle_request)
 
     async def get_markdown(self) -> str:
-        script = "canvasContextHandler.data.complete;"
-        time0 = time.time()
-        while time.time() - time0 < 10:
-            result = await self._page.evaluate(script)
-            if result:
-                break
-            await asyncio.sleep(1)
+        # 由浏览器侧判断渲染完成，条件满足时立即返回；超时则按现有内容继续
+        try:
+            await self._page.wait_for_function(
+                "() => window.canvasContextHandler && canvasContextHandler.data.complete",
+                timeout=10 * 1000,
+                polling=100,
+            )
+        except PlaywrightTimeoutError:
+            logging.info(
+                "[%s] Wait for canvas complete timeout" % self.__class__.__name__
+            )
         script = "canvasContextHandler.data.markdown;"
         result = await self._page.evaluate(script)
         if not result:
@@ -631,25 +513,30 @@ class WeReadWebPage(object):
     async def _check_next_page(self) -> None:
         while True:
             try:
-                await self.wait_for_selector("button.readerFooter_button", timeout=60)
-            except pyppeteer.errors.TimeoutError:
+                # 竖向滚动模式渲染完成后出现「下一章」按钮；横向翻页模式则是「上一页/下一页」
+                await self._page.wait_for_selector(
+                    "button.readerFooter_button, button.renderTarget_pager_button",
+                    timeout=60 * 1000,
+                )
+            except PlaywrightTimeoutError:
                 logging.info("[%s] load selector timeout " % self.__class__.__name__)
+                await self._dump_page_state()
                 break
-            result = await self._page.evaluate(
-                "document.getElementsByClassName('readerFooter_button')[0].innerText;"
-            )
+            if await self._page.locator("button.renderTarget_pager_button").count():
+                raise HorizontalReaderError()
+            button = self._page.locator("button.readerFooter_button").first
+            result = (await button.inner_text()).strip()
             if result == "下一页":
                 logging.info("[%s] Go to next page" % self.__class__.__name__)
                 await self._page.evaluate(
                     r"canvasContextHandler.data.markdown += '\n\n';"
                 )
-                await self.pre_load_page()
-                await self._page.click("button.readerFooter_button")
+                await button.click()
                 await asyncio.sleep(1)
             elif result == "下一章":
                 break
             elif result.startswith("登录"):
-                raise utils.LoginRequiredError()
+                raise utils.LoginRequiredError("Login required to read this chapter")
             else:
                 raise NotImplementedError(result)
 
@@ -660,17 +547,46 @@ class WeReadWebPage(object):
             utils.wr_hash(str(chapter_id)),
         )
 
+    async def _switch_to_vertical_reader(self) -> None:
+        """从横向翻页模式切换到竖向滚动模式
+
+        登录用户的阅读模式偏好保存在账号侧，wr_useHorizonReader cookie 无法强制。
+        横向模式下一屏画布会包含跨章节的内容，无法按章导出，必须切回竖向模式。
+        """
+        logging.info(
+            "[%s] Horizontal reader detected, switch to vertical reader"
+            % self.__class__.__name__
+        )
+        toggle = self._page.locator("button.readerControls_item.isHorizontalReader")
+        if not await toggle.count():
+            raise RuntimeError(
+                "Horizontal reader detected, but the mode toggle button is missing"
+            )
+        await toggle.first.click(timeout=5000)
+        await self._page.wait_for_selector("button.readerFooter_button", timeout=30 * 1000)
+
     async def goto_chapter(self, chapter_id: str, timeout: int = 120) -> None:
         logging.info("[%s] Go to chapter %s" % (self.__class__.__name__, chapter_id))
-        # await self.clear_cache()
-        await self.pre_load_page()
         self._url = self._get_chapter_url(chapter_id)
-        await self._page.goto(self._url, timeout=1000 * timeout)
+        await self._page.goto(
+            self._url, timeout=1000 * timeout, wait_until="domcontentloaded"
+        )
+        # 需要登录时抛出 LoginRequiredError，由调用方在超时保护之外处理扫码登录
         try:
             await self._check_next_page()
-        except utils.LoginRequiredError:
-            await self.login()
-            return await self.goto_chapter(chapter_id, timeout=timeout)
+        except HorizontalReaderError:
+            await self._switch_to_vertical_reader()
+            # 切换前画布上已经画过横向模式的内容，重新加载让钩子从头记录本章
+            await self._page.goto(
+                self._url, timeout=1000 * timeout, wait_until="domcontentloaded"
+            )
+            try:
+                await self._check_next_page()
+            except HorizontalReaderError:
+                raise RuntimeError(
+                    "Reader is still in horizontal mode after switching, "
+                    "please switch to vertical mode manually in the browser"
+                )
 
     async def clear_cache(self) -> None:
         await self._page.evaluate("canvasContextHandler.clearCanvasCache();")

@@ -3,12 +3,7 @@ import asyncio
 import logging
 import os
 import sys
-from typing import Callable, Optional, List
-
-if sys.version_info >= (3, 8):
-    from typing import TYPE_CHECKING
-else:
-    from typing_extensions import TYPE_CHECKING
+from typing import Optional, List, Tuple
 
 from . import utils, webpage
 
@@ -26,18 +21,6 @@ def patch_macos() -> None:
     fallback_lib_path: str = os.environ.get("DYLD_FALLBACK_LIBRARY_PATH", "")
     if not fallback_lib_path:
         os.environ["DYLD_FALLBACK_LIBRARY_PATH"] += "/opt/homebrew/lib"
-
-
-def patch_generateRequestHash() -> None:
-    from pyppeteer import network_manager
-
-    orig_generateRequestHash: Callable[..., str] = network_manager.generateRequestHash
-
-    def patched_generateRequestHash(request):
-        request["headers"].pop("Origin", None)
-        return orig_generateRequestHash(request)
-
-    network_manager.generateRequestHash = patched_generateRequestHash
 
 
 async def async_main() -> int:
@@ -58,46 +41,78 @@ async def async_main() -> int:
     )
     parser.add_argument(  # pyright: ignore[reportUnusedCallResult]
         "--load-timeout",
-        help="load chapter page timeout",
+        help="load chapter page timeout in seconds",
         type=int,
         default=60,
     )
     parser.add_argument(  # pyright: ignore[reportUnusedCallResult]
         "--load-interval",
-        help="load chapter page interval time",
-        type=int,
-        default=30,
+        help="seconds to wait between chapters, a number or a random range like 15-45 (default: 15-45)",
+        default="15-45",
+    )
+    parser.add_argument(  # pyright: ignore[reportUnusedCallResult]
+        "--rest-every",
+        help="take a longer rest after every N exported chapters, a number or a range like 10-20, 0 to disable (default: 10-20)",
+        default="10-20",
+    )
+    parser.add_argument(  # pyright: ignore[reportUnusedCallResult]
+        "--rest-interval",
+        help="seconds of the longer rest, a number or a range like 60-120 (default: 60-120)",
+        default="60-120",
     )
     parser.add_argument(  # pyright: ignore[reportUnusedCallResult]
         "--css-file",
         help="overide default css style",
     )
     parser.add_argument(  # pyright: ignore[reportUnusedCallResult]
-        "--headless", help="chrome headless", action="store_true", default=False
-    )
-    parser.add_argument(  # pyright: ignore[reportUnusedCallResult]
-        "--force-login", help="force login first", action="store_true", default=False
-    )
-    parser.add_argument(  # pyright: ignore[reportUnusedCallResult]
-        "--use-default-profile",
-        help="use default profile",
+        "--headless",
+        help="chrome headless (login must be done in a non-headless run first)",
         action="store_true",
         default=False,
     )
     parser.add_argument(  # pyright: ignore[reportUnusedCallResult]
-        "--mock-user-agent",
-        help="use mock user-agent",
+        "--force-login",
+        help="clear saved login state and login again",
         action="store_true",
         default=False,
+    )
+    parser.add_argument(  # pyright: ignore[reportUnusedCallResult]
+        "--guest",
+        help="export without login (only free preview chapters)",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(  # pyright: ignore[reportUnusedCallResult]
+        "--profile-dir",
+        help="chrome profile dir used to keep login state (default: cache/chrome-profile)",
     )
     parser.add_argument(  # pyright: ignore[reportUnusedCallResult]
         "--proxy-server",
         help="http proxy server, e.g. http://127.0.0.1:8888",
     )
+    parser.add_argument(  # pyright: ignore[reportUnusedCallResult]
+        "--debug",
+        help="save browser console output to cache/<book_id>/console.log",
+        action="store_true",
+        default=False,
+    )
     args = parser.parse_args()
     args.output_format = args.output_format or ["epub"]  # pyright: ignore[reportAny]
     if "mobi" in args.output_format and "epub" not in args.output_format:
         args.output_format.append("epub")  # pyright: ignore[reportUnusedCallResult]
+
+    try:
+        load_interval: Tuple[float, float] = utils.parse_range(
+            args.load_interval, "--load-interval"  # pyright: ignore[reportAny]
+        )
+        rest_every: Tuple[float, float] = utils.parse_range(
+            args.rest_every, "--rest-every"  # pyright: ignore[reportAny]
+        )
+        rest_interval: Tuple[float, float] = utils.parse_range(
+            args.rest_interval, "--rest-interval"  # pyright: ignore[reportAny]
+        )
+    except ValueError as ex:
+        parser.error(str(ex))
 
     extra_css: Optional[str] = None
     if args.css_file:  # pyright: ignore[reportAny]
@@ -114,12 +129,16 @@ async def async_main() -> int:
     else:
         book_list = [args.book_id]  # pyright: ignore[reportAny]
 
+    # 只在首次启动浏览器时强制重新登录，之后的书籍复用登录态
+    force_login: bool = args.force_login  # pyright: ignore[reportAny]
+
     for book_id in book_list:
         logging.info("Exporting book %s" % book_id)
         page = webpage.WeReadWebPage(
             book_id,
-            cookie_path=os.path.join("cache", "cookie.txt"),
+            profile_dir=args.profile_dir,  # pyright: ignore[reportAny]
             webcache_path="cache",
+            debug=args.debug,  # pyright: ignore[reportAny]
         )
         if not await page.check_valid():
             logging.warning("Book %s status is invalid, stop exporting" % book_id)
@@ -129,28 +148,49 @@ async def async_main() -> int:
         if not os.path.isdir(output_dir):
             os.mkdir(output_dir)
         exporter = export.WeReadExporter(page, save_path)
+        launch_failed = 0
         while True:
             try:
                 await page.launch(
                     headless=args.headless,  # pyright: ignore[reportAny]
-                    force_login=args.force_login,  # pyright: ignore[reportAny]
-                    use_default_profile=args.use_default_profile,  # pyright: ignore[reportAny]
-                    mock_user_agent=args.mock_user_agent,  # pyright: ignore[reportAny]
+                    force_login=force_login,
+                    allow_guest=args.guest,  # pyright: ignore[reportAny]
                     proxy_server=args.proxy_server,  # pyright: ignore[reportAny]
                 )
             except utils.BreakExportingError:
                 logging.info("Exit process...")
+                await page.close()
+                return -1
+            except (utils.LoginRequiredError, utils.ChromeNotInstalledError) as ex:
+                logging.error("%s" % ex)
+                await page.close()
                 return -1
             except RuntimeError:
                 logging.exception("Launch book %s home page failed" % book_id)
+                # 必须先关闭，否则残留进程会锁住 profile 目录导致下次启动失败
+                await page.close()
+                launch_failed += 1
+                if launch_failed >= 3:
+                    logging.error("Launch browser failed %d times, stop exporting" % launch_failed)
+                    return -1
                 await asyncio.sleep(2)
                 continue
+            force_login = False
 
             try:
-                await exporter.export_markdown(args.load_timeout, args.load_interval)
+                await exporter.export_markdown(
+                    args.load_timeout,  # pyright: ignore[reportAny]
+                    load_interval,
+                    rest_every,
+                    rest_interval,
+                )
             except utils.LoadChapterFailedError:
                 logging.warning("Load chapter failed, close browser and retry")
                 await page.close()
+            except (utils.LoginRequiredError, utils.BreakExportingError) as ex:
+                logging.error("Export stopped: %s" % ex)
+                await page.close()
+                return -1
             else:
                 await page.close()
                 break
@@ -211,7 +251,6 @@ def main() -> int:
         patch_windows()
     elif sys.platform == "darwin":
         patch_macos()
-    patch_generateRequestHash()
     utils.check_cairo_installed()
     logging.root.level = logging.INFO
     handler = logging.StreamHandler()
@@ -223,7 +262,11 @@ def main() -> int:
     asyncio.set_event_loop(loop)
     try:
         return loop.run_until_complete(async_main())
-    except:
+    except KeyboardInterrupt:
+        logging.info("Interrupted by user")
+        return -1
+    except Exception:
+        # 不能用裸 except，否则 argparse 的 --help 触发的 SystemExit 也会被当成错误打印
         import traceback
 
         traceback.print_exc()

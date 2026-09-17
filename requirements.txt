@@ -3,6 +3,6 @@ beautifulsoup4
 ebooklib
 markdown
 Pillow; sys_platform == 'win32'
-pyppeteer
+playwright
 weasyprint==52.5
 typing_extensions>=3.7.4; python_version<"3.8"

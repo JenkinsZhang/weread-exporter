@@ -1,0 +1,36 @@
+[project]
+name = "weread-exporter"
+description = "Export WeRead (微信读书) books to epub / pdf / mobi / txt"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+dynamic = ["version"]
+dependencies = [
+    "aiohttp",
+    "beautifulsoup4",
+    "ebooklib",
+    "markdown",
+    "Pillow; sys_platform == 'win32'",
+    "playwright",
+    "weasyprint==52.5",
+]
+
+[project.urls]
+Homepage = "https://github.com/JenkinsZhang/weread-exporter"
+Upstream = "https://github.com/drunkdream/weread-exporter"
+
+[project.scripts]
+weread-exporter = "weread_exporter.__main__:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["weread_exporter"]
+
+[tool.setuptools.dynamic]
+version = { attr = "weread_exporter.VERSION" }
+
+[tool.setuptools.package-data]
+weread_exporter = ["*.js", "*.css", "bin/linux/*", "bin/win32/*"]
