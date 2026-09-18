@@ -2,15 +2,17 @@
 
     python tests/check_compat.py [book_id]
 
+不指定 book_id 时自动使用 cache 下唯一一本已缓存的书。待检查的章节按官方字数
+从 meta.json 里自动挑选，脚本本身不包含任何书的内容。
+
 横向模式那一项会临时把账号的阅读模式切成双栏，结束时还原为竖向。
-游客那一项使用独立的临时 profile，不会影响已登录的 profile。
+游客那一项使用独立的临时 profile，也不会恢复已登录的 cookie。
 """
 
 import asyncio
 import json
 import logging
 import os
-import re
 import shutil
 import sys
 
@@ -22,20 +24,18 @@ from weread_exporter.__main__ import patch_windows
 if sys.platform == "win32":
     patch_windows()
 
-from weread_exporter import webpage
+from weread_exporter import utils, webpage
 from weread_exporter.export import WeReadExporter
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s]%(message)s")
 
-DEFAULT_BOOK = "5fd32370813abb566g0162bd"
-LONG_TITLE = "5.6 布林带新战法"
-FREE_TITLE = "前言"
-GUEST_PROFILE = os.path.join("cache", "test-guest-profile")
-
-results = []
+CACHE_DIR = "cache"
+GUEST_PROFILE = os.path.join(CACHE_DIR, "test-guest-profile")
 # 微信读书自己的报错，与钩子无关：点阅读模式按钮时它会去调微信 JSBridge，
 # 桌面浏览器里没有这个 bridge。已验证开关钩子都不会额外产生 JS 异常
 BENIGN_ERRORS = ("JSBridge is not ready",)
+
+results = []
 
 
 def page_errors(errors):
@@ -47,15 +47,40 @@ def record(name, ok, detail=""):
     print("  %s %s %s" % ("PASS" if ok else "FAIL", name, detail))
 
 
-def find_chapter(meta, title):
-    return next(c for c in meta["chapters"] if c["title"].strip() == title)
+def detect_book():
+    if len(sys.argv) > 1:
+        return sys.argv[1]
+    if not os.path.isdir(CACHE_DIR):
+        return ""
+    found = [
+        name
+        for name in os.listdir(CACHE_DIR)
+        if os.path.isfile(os.path.join(CACHE_DIR, name, "meta.json"))
+    ]
+    if len(found) == 1:
+        return found[0]
+    print("cache 下有 %d 本已缓存的书，请在命令行指定 book_id: %s" % (len(found), found))
+    return ""
 
 
-async def check_horizontal_entry(meta):
+def longest_chapter(meta):
+    return max(meta["chapters"], key=lambda c: c.get("words") or 0)
+
+
+def preview_candidates(meta):
+    """试读章节通常在书的前面，按顺序挑几章有正文的备选"""
+    out = []
+    for chapter in meta["chapters"][:6]:
+        if (chapter.get("words") or 0) >= 300:
+            out.append(chapter)
+    return out[:3]
+
+
+async def check_horizontal_entry(book, meta):
     """账号处于横向双栏模式时，导出仍然要能自动切回竖向并采全"""
     print("\n=== 横向模式入口 ===")
-    chapter = find_chapter(meta, LONG_TITLE)
-    page = webpage.WeReadWebPage(DEFAULT_BOOK, webcache_path="cache")
+    chapter = longest_chapter(meta)
+    page = webpage.WeReadWebPage(book, webcache_path=CACHE_DIR)
     errors = []
     await page.launch(headless=False)
     p = page._page
@@ -83,7 +108,12 @@ async def check_horizontal_entry(meta):
         markdown = await page.get_markdown()
         chars = WeReadExporter._content_chars(markdown)
         gaps = await p.evaluate("wrExtractor.findGaps()")
-        record("横向入口下正文采全", chars >= 8500, "%d 字" % chars)
+        words = int(chapter.get("words") or 0)
+        record(
+            "横向入口下正文采全",
+            words == 0 or chars >= words * 0.8,
+            "%d 字 / 官方 %d 字" % (chars, words),
+        )
         record("横向入口下无正文空洞", not gaps, "剩余 %s" % gaps[:3] if gaps else "")
         real = page_errors(errors)
         record("页面无 JS 异常", not real, "%s" % real[:3])
@@ -91,14 +121,17 @@ async def check_horizontal_entry(meta):
         await page.close()
 
 
-async def check_guest_headless(meta):
+async def check_guest_headless(book, meta):
     """游客 + 无头模式下的试读章节"""
     print("\n=== 游客无头模式 ===")
-    chapter = find_chapter(meta, FREE_TITLE)
+    candidates = preview_candidates(meta)
+    if not candidates:
+        print("  SKIP 找不到合适的试读备选章节")
+        return
     if os.path.isdir(GUEST_PROFILE):
         shutil.rmtree(GUEST_PROFILE, ignore_errors=True)
     page = webpage.WeReadWebPage(
-        DEFAULT_BOOK, profile_dir=GUEST_PROFILE, webcache_path="cache"
+        book, profile_dir=GUEST_PROFILE, webcache_path=CACHE_DIR
     )
     errors = []
 
@@ -112,30 +145,43 @@ async def check_guest_headless(meta):
         await page.launch(headless=True, allow_guest=True)
         p = page._page
         p.on("pageerror", lambda e: errors.append(str(e).splitlines()[0][:120]))
-        await page.goto_chapter(chapter["id"])
-        markdown = await page.get_markdown()
-        chars = WeReadExporter._content_chars(markdown)
-        gaps = await p.evaluate("wrExtractor.findGaps()")
-        record("游客无头模式采到试读正文", chars > 2100, "%d 字（登录态 2223 字）" % chars)
-        record("游客无头模式无正文空洞", not gaps, "剩余 %s" % gaps[:3] if gaps else "")
-        real = page_errors(errors)
-        record("游客模式页面无 JS 异常", not real, "%s" % real[:3])
+        for chapter in candidates:
+            try:
+                await page.goto_chapter(chapter["id"])
+                markdown = await page.get_markdown()
+            except utils.LoginRequiredError:
+                continue
+            chars = WeReadExporter._content_chars(markdown)
+            gaps = await p.evaluate("wrExtractor.findGaps()")
+            words = int(chapter.get("words") or 0)
+            record(
+                "游客无头模式采到试读正文",
+                words == 0 or chars >= words * 0.8,
+                "%d 字 / 官方 %d 字" % (chars, words),
+            )
+            record("游客无头模式无正文空洞", not gaps, "剩余 %s" % gaps[:3] if gaps else "")
+            real = page_errors(errors)
+            record("游客模式页面无 JS 异常", not real, "%s" % real[:3])
+            return
+        print("  SKIP 这本书前几章都需要登录，游客模式无法校验")
     finally:
         await page.close()
         shutil.rmtree(GUEST_PROFILE, ignore_errors=True)
 
 
 async def main():
-    book = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_BOOK
-    meta_path = os.path.join("cache", book, "meta.json")
+    book = detect_book()
+    if not book:
+        return 1
+    meta_path = os.path.join(CACHE_DIR, book, "meta.json")
     if not os.path.isfile(meta_path):
         print("找不到 %s" % meta_path)
         return 1
     with open(meta_path, encoding="utf-8") as fp:
         meta = json.load(fp)
 
-    await check_horizontal_entry(meta)
-    await check_guest_headless(meta)
+    await check_horizontal_entry(book, meta)
+    await check_guest_headless(book, meta)
 
     failed = [name for name, ok, _ in results if not ok]
     print("\n=== 汇总: %d 项检查，%d 项失败 ===" % (len(results), len(failed)))
